@@ -1,0 +1,403 @@
+---
+title: "annotate"
+author: "Huiwen Duan"
+date: "10/26/2019"
+output: html_document
+---
+```{r}
+#install.packages("rfUtilities")
+#install.packages("BioMed")
+#install.packages("fastDummies")
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(stringr)
+library(boot)
+library(randomForest)
+library(rfUtilities)
+library(caret)
+```
+read in data 
+```{r warning = FALSE, message = FALSE}
+anno<-read_xlsx("annotations.xlsx")
+anno_orig<-anno
+any(duplicated(anno_orig[,1]))
+all(is.na(anno_orig$detection_id))
+# get rid of detection_id column, which is empty, and the row number column
+anno<-anno%>%dplyr::select(-detection_id,-`...1`)
+# get rid of duplicated rows
+anno<-anno%>%distinct()
+```
+# Exploratory Analysis 
+## Explore and clean up variables:
++ Predictor variables: 
+1. world_center_zyx: character, the marking in the real world coordinate system
+     - plot the coordinates in 3D
+     - separate it into three variables x y z
+2. radius_mm: numerical, radius of a marking in mm
+3. classification: categorical, annotator's classification. NAs(n=11520) means machine's annotations. so replace NAs with 999
+4. user_id: categorical variable. nas(n=11520) means machine, so replace NA with 0.
+     - machine and human mark on the same observations. consider random effect mixture model 
+5. series_id: character, the diameter in mm of the region over which the imagery data were collected. 
+     - All starts with "2.25.", so get rid of "2.25." and
+     - Make it numerical 
+6. val_risk: categorical, 1-4/na
+7. val_classification: categorical, 1-7/na
+8. data_collection_diameter: categorical with two levels
+9. manufacturer: categorical, 
+10. kvp: categorical with 2 levels, peak kilo voltage output of the x-ray generator used
+11. manufacturer_model: categorical with 7 levels
+12. recon_kernel: categorical with 9 levels, the algorithm used to build the 3D image
+13. body_part: categorical with 2 levels, chest versus other. change nas to other 
+14. recon_diameter: numerical variable, diameter in mm of the region from within which data were used in creating the reconstruction of the image
+15. image_type: categorical with 3 levels
+16. detection_id: all NAs, eliminate.
+17. prob_fpr: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+18. prob_rpn: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+19. nodule_score: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+
++ human specific variables: 
+3. classification: categorical, annotator's classification. NAs(n=11520) means machine's annotations. so replace NAs with 999
+6. val_risk: categorical, 1-4/na
+7. val_classification: categorical, 1-7/na
+
++ machine specific variables
+17. prob_fpr: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+18. prob_rpn: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+19. nodule_score: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+      
+response variable: GT, categorical, 0/1
+
+```{r}
+anno[is.na(anno$user_id),"user_id"]<-0
+anno[is.na(anno$body_part),"body_part"]<-"OTHER"
+anno$recon_diameter<-as.numeric(anno$recon_diameter)
+anno$data_collection_diameter<-as.numeric(anno$data_collection_diameter)
+row.names(anno)<-1:nrow(anno)
+```
+## Explore consensus on classification and val_classification
+```{r}
+#get positive machine GT observations
+trueHumanGT<-anno_data[anno_data$GT == 1& anno_data$user_id!=0,]
+mean(as.numeric(trueHumanGT$classification==trueHumanGT$val_classification))
+t<-table(trueGT$classification,trueGT$val_classification)
+heatmap(t, scale="column",Colv = NA, Rowv = NA,xlab="classification", ylab="val_classification")
+```
+## Explore world_center_zyx 
++ world_center_zyx is the unique index of nodules. An nodule may be annotated by 1-6 annotators, including machine
+```{r}
+#extract coordinates from world_center_zyx
+coordinates<-str_extract_all(anno$world_center_zyx,"-?\\d+\\.?\\d+(e[+-]?\\d+)?",simplify = TRUE)
+coordinates<-as.data.frame(coordinates)
+names(coordinates)<-c("z","y","x")
+coordinates$radius<-anno$radius_mm
+```
+
+```{r}
+# complete anno data with coordinates
+anno_data<-cbind(coordinates[,-4],anno)
+anno_data<-anno_data%>%dplyr::select(-world_center_zyx)
+str(anno_data)
+```
+```{r}
+#make xyz numerical
+anno_data[,1:3]<-apply(anno_data[,1:3],2,as.character)
+anno_data[,1:3]<-apply(anno_data[,1:3],2,as.numeric)
+```
+
+
+## Explore machine versus human annotations
+851 observations have both human and machine annotated 
+```{r}
+# subset machine and human annotations
+machine_anno<-anno%>%filter(user_id==0)
+human_anno<-anno%>%filter(user_id!=0)
+length(unique(anno$world_center_zyx))
+
+cross_machine<-machine_anno[which(machine_anno$world_center_zyx%in%human_anno$world_center_zyx),]
+cross_human<-human_anno[which(machine_anno$world_center_zyx%in%human_anno$world_center_zyx),]
+
+#plot GT against machine/human
+is.machine<-as.numeric(anno_data1$user_id == 0)
+counts <- table(is.machine,1-anno_data1$GT)
+GT_mh<-barplot(counts,col=c("black","light yellow"), names.arg=c("Machine Annotations", "Human Annotations"),legend = c("Incorrect","Correct"),xlim=c(0,4))
+```
+## Explore radius_mm 
+```{r}
+anno_data1<-anno_data%>%dplyr::select(-classification,-val_risk,-val_classification,-prob_fpr,-prob_rpn,-nodule_score)
+testSet<-anno_data1%>%select(-x,-y,-z)
+testSet<-cbind(testSet,id[,-1])
+testSet$identifier<-anno$world_center_zyx
+
+machine_anno<-testSet[testSet$user_id==0,]
+human_anno<-testSet[testSet$user_id!=0,]
+testMachine<-machine_anno[which(machine_anno$identifier%in%human_anno$identifier),]
+crosses<-machine_anno[which(machine_anno$identifier%in%human_anno$identifier),"identifier"]
+testHuman<-human_anno[which(human_anno$identifier%in%crosses),]
+
+# x is human, y is machine 
+df<-data.frame(type = c(rep("Human",851),rep("Machine",851)),radius=c(shared$radius_mm.x,shared$radius_mm.y))
+dim(shared)
+shared<-merge(testHuman_distinct,testMachine,by="identifier")
+
+df5<-data.frame(type = c(rep("Human",nrow(human_anno)),rep("Machine",nrow(machine_anno))),radius=c(human_anno$radius_mm,machine_anno$radius_mm))
+
+#plot radius against human/machine in shared coordinates
+ggplot(df, aes(x=type, y=radius)) + 
+  geom_boxplot(outlier.shape=NA) + #avoid plotting outliers twice
+  geom_jitter(position=position_jitter(width=.1, height=0))
+#plot radius against human/machine in all data 
+ggplot(df5, aes(x=type, y=radius)) + 
+  geom_boxplot(outlier.shape=NA) + #avoid plotting outliers twice
+  geom_jitter(position=position_jitter(width=.1, height=0))
+
+length(unique(anno$world_center_zyx))
+```
+
+## Explore machine annotation variables
++ there are 10 observations with prob_rpn true. They include the only one true prob_fpr, the only seven true nodule_score
+```{r}
+summary(anno_data)
+str(anno_data)
+anno_data%>%filter(!is.na(prob_rpn))%>%filter(prob_rpn)
+```
+
+# Build Model to Predict GT
+Predictor variables: 
+1. coordinates: x,y,z numerical 
+2. radius_mm: numerical, radius of a marking in mm
+(3.) classification: categorical, annotator's classification. NAs(n=11520) means machine's annotations. so replace NAs with 999
+4. user_id: categorical variable. nas(n=11520) means machine, so replace NA with 0.
+     - machine and human mark on the same observations. consider random effect mixture model 
+5. series_id: numerical, the diameter in mm of the region over which the imagery data were collected. 
+(6.) val_risk: categorical, 1-4/na
+(7.) val_classification: categorical, 1-7/na
+8. data_collection_diameter: numerical with two levels
+9. manufacturer: categorical, 
+10. kvp: categorical with 2 levels, peak kilo voltage output of the x-ray generator used
+11. manufacturer_model: categorical with 7 levels
+12. recon_kernel: categorical with 9 levels, the algorithm used to build the 3D image
+13. body_part: categorical with 2 levels, chest versus other. change nas to other 
+14. recon_diameter: numerical variable, diameter in mm of the region from within which data were used in creating the reconstruction of the image
+15. image_type: categorical with 3 levels
+16. prob_fpr: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+17. prob_rpn: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+18. nodule_score: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+```{r}
+# factorize categorical variables 
+anno_data$z<-as.numeric(anno_data$z)
+anno_data$y<-as.numeric(anno_data$y)
+anno_data$x<-as.numeric(anno_data$x)
+anno_data$classification<-as.factor(anno_data$classification)
+anno_data$user_id<-as.factor(anno_data$user_id)
+anno_data$GT<-as.factor(anno_data$GT)
+str(anno_data[,9:21])
+anno_data[,9:21]<-apply(anno_data[,9:21],2,as.factor)
+```
+
+model1: logistic regression
+predictors: 
+1. coordinates: x,y,z numerical 
+2. radius_mm: numerical, radius of a marking in mm
+(3.) classification: categorical, annotator's classification. NAs(n=11520) means machine's annotations. so replace NAs with 999
+4. user_id: categorical variable. nas(n=11520) means machine, so replace NA with 0.
+     - machine and human mark on the same observations. consider random effect mixture model 
+5. series_id: id of a CT series. Change to dummy variables. 
+(6.) val_risk: categorical, 1-4/na
+(7.) val_classification: categorical, 1-7/na
+8. data_collection_diameter: numerical with two levels
+9. manufacturer: categorical, 
+10. kvp: categorical with 2 levels, peak kilo voltage output of the x-ray generator used
+11. manufacturer_model: categorical with 7 levels
+12. recon_kernel: categorical with 9 levels, the algorithm used to build the 3D image
+13. body_part: categorical with 2 levels, chest versus other. change nas to other 
+14. recon_diameter: numerical variable, diameter in mm of the region from within which data were used in creating the reconstruction of the image
+15. image_type: categorical with 3 levels
+(16.) prob_fpr: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+(17.) prob_rpn: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+(18.) nodule_score: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+
+Excluding human specific and machine specific variables, which are
++ human specific variables: 
+3. classification: categorical, annotator's classification. NAs(n=11520) means machine's annotations. so replace NAs with 999
+6. val_risk: categorical, 1-4/na
+7. val_classification: categorical, 1-7/na
+
++ machine specific variables
+17. prob_fpr: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+18. prob_rpn: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical 
+19. nodule_score: TRUE/FALSE/NA(human annotators)
+      - change to three level categorical
+
+## Excluding human specific and machine specific variables
+### Final Model: random forest  
+```{r}
+anno_data1<-anno_data%>%dplyr::select(-classification,-val_risk,-val_classification,-prob_fpr,-prob_rpn,-nodule_score)
+str(anno_data)
+for(i in c(9:13,15)){
+  anno_data1[,i]<-as.factor(anno_data1[,i])
+}
+```
+
+```{r} 
+set.seed(1998)
+perf<-list()
+# test out hyperparameters
+#for (i in 5:10){
+#  modelRF<-randomForest(GT~.,data=anno_data1,mtry = i)
+#  predictionRF<-modelRF$predicted
+#  perf[[i-4]]<-confusionMatrix(anno_data1$GT,modelRF$predicted,positive = "1")
+#}
+anno_data1$identifier<-anno$world_center_zyx
+anno_data1_distinct<-anno_data1[!duplicated(anno_data1$identifier),]%>%dplyr::select(-identifier)
+```
+explore series_id variable
+```{r}
+#make dummy variables
+id<-fastDummies::dummy_cols(as.factor(as.character(anno_data$series_id)))
+names(id)[2:length(id)]<-paste("V", 1:(ncol(id)-1), sep = "_")
+id_GT<-cbind(anno_data$GT,id[,-1])
+id_GT<-data.frame(id_GT)
+```
+inplement random forest model
+```{r}
+test_data3<-anno_data1%>%select(-series_id,-x,-y,-z)
+test_data3<-cbind(test_data3,id[,-1])
+test_data3$identifier<-anno$world_center_zyx
+test_data3<-test_data3[!duplicated(test_data3$identifier),]
+test_data3<-test_data3%>%select(-identifier)
+table(test_data3$manufacturer)
+t3<-randomForest(factor(GT)~.,data=test_data3,mtry = 5,importance=TRUE)
+predictiont3<-t3$predicted
+confusionMatrix(factor(test_data3$GT),predictiont3,positive = "1")
+# get variable importance
+varImpPlot(t3,n.var = 10)
+str(anno_data1)
+```
+test the model on human/machine shared coordinates
+```{r}
+testSet<-anno_data1%>%select(-series_id,-x,-y,-z)
+testSet<-cbind(testSet,id[,-1])
+testSet$identifier<-anno$world_center_zyx
+#machine annotations
+machine_anno<-testSet[testSet$user_id==0,]
+#human annotations
+human_anno<-testSet[testSet$user_id!=0,]
+
+#machine annotations on the shared coordinates
+testMachine<-machine_anno[which(machine_anno$identifier%in%human_anno$identifier),]
+crosses<-machine_anno[which(machine_anno$identifier%in%human_anno$identifier),"identifier"]
+#human annotations on the shared coordinates
+testHuman<-human_anno[which(human_anno$identifier%in%crosses),]
+testMachine<-testMachine%>%dplyr::select(-identifier)
+testHuman<-testHuman%>%dplyr::select(-identifier)
+
+p1<-predict(t3,testMachine)
+confusionMatrix(factor(testMachine$GT),p1,positive = "1")
+
+p2<-predict(t3,testHuman)
+confusionMatrix(factor(testHuman$GT),p2,positive = "1")
+```
+## Exploratory Modelings
+### Part2: human only
+```{r}
+#exclude human specific and machine specific variables
+humanRF<-randomForest(GT~.,data=anno_data1%>%filter(user_id!=0),mtry = 5)
+human_data1<-anno_data1%>%filter(user_id!=0)
+confusionMatrix(human_data1$GT,humanRF$predicted,positive = "1")
+```
+
+```{r}
+#include human specific variables
+human_data2<-anno_data%>%dplyr::select(-prob_fpr,-prob_rpn,-nodule_score)%>%filter(user_id!=0)
+human_data2[is.na(human_data2$val_classification),"val_classification"]<-99
+human_data2[is.na(human_data2$val_risk),"val_risk"]<-99
+dim(human_data2)
+for(i in c(5:16,18)){
+  human_data2[,i]<-as.factor(human_data2[,i])
+}
+
+summary(human_data2)
+human_data2<-human_data2%>%dplyr::select(-series_id)
+
+human_data2$body_part<-as.numeric(human_data2$body_part)
+
+humanRF2<-randomForest(GT~.,data=human_data2,mtry = 5)
+humanRF2$importance
+t<-as.factor(human_data2$val_classification)
+table(t)
+```
+
+### Part3: machine only
+```{r}
+machine_data1<-anno_data1%>%filter(user_id==0)
+machineRF<-randomForest(GT~.,data=machine_data1,mtry = 5)
+confusionMatrix(machine_data1$GT,machineRF$predicted,positive = "1")
+table(machine_data1$GT)
+```
+```{r}
+index<-sample(nrow(anno_data1),0.9*nrow(anno_data1))
+training<-anno_data1[index,]
+testing<-anno_data1[-index,]
+model1<-glm(GT~.,data = training,family="binomial")
+#summary(model1)
+prediction<-predict(model1,newdata = testing,type="response")
+?predict
+prediction_class<-as.numeric(prediction>0.5)
+mean(prediction_class == testing$GT)
+
+```
+
+# Interactive plots of coordinates
+```{r}
+# plot coordinates in the same series_id in machine annotations
+machine_anno<-anno_data[anno_data$user_id==0,]
+frequent_series<-table(machine_anno$series_id)%>%sort(decreasing = TRUE)%>%head(5)
+anno_data$series_id<-as.factor(anno_data$series_id)
+
+df1<-machine_anno[which(machine_anno$series_id==names(frequent_series[1])),]
+
+dim(df1)
+p <- plot_ly(df1, x = ~x, y = ~y, z = ~z,marker = list(color = ~radius_mm, colorscale = c('#FFE1A1', '#683531'), showscale = TRUE, main = "machine")) %>%
+  add_markers() %>%
+  layout(title = "Machine Annotations Under the Most Frequent Series_id",
+         scene = list(xaxis = list(title = 'x'),
+                     yaxis = list(title = 'y'),
+                     zaxis = list(title = 'z')))
+p
+
+```
+
+```{r}
+# plot coordinates in the same series_id with both human and machine annotations
+frequent_series_c<-table(anno_data$series_id)%>%sort(decreasing = TRUE)%>%head(5)
+anno_data$series_id<-as.factor(anno_data$series_id)
+
+dff1<-anno_data[which(anno_data$series_id==names(frequent_series_c[1])),]
+dff1$is_machine<-as.numeric(dff1$user_id==0)
+dim(dff1)
+p <- plot_ly(dff1, x = ~x, y = ~y, z = ~z,marker = list(color = ~is_machine, colorscale = c('white', 'red'))) %>%
+  add_markers() %>%
+  layout(title = "Machine&Human Annotations Under the Most Frequent Series_id"
+         ,scene = list(xaxis = list(title = 'x'),
+                     yaxis = list(title = 'y'),
+                     zaxis = list(title = 'z')))
+p
+```
+
